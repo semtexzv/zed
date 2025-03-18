@@ -6,10 +6,11 @@ use super::{
 use crate::{
     hash, Action, AnyWindowHandle, BackgroundExecutor, ClipboardEntry, ClipboardItem,
     ClipboardString, CursorStyle, ForegroundExecutor, Image, ImageFormat, Keymap, MacDispatcher,
-    MacDisplay, MacWindow, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
+    MacDisplay, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay,
     PlatformTextSystem, PlatformWindow, Result, ScreenCaptureSource, SemanticVersion, Task,
     WindowAppearance, WindowParams,
 };
+use super::window::MacWindow;
 use anyhow::{anyhow, Context as _};
 use block::ConcreteBlock;
 use cocoa::{

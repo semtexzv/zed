@@ -1,7 +1,7 @@
 use gpui::{
     div, hsla, prelude::*, px, rgb, rgba, size, App, Application, Bounds, Context,
-    FrostedGlassBlending, FrostedGlassMaterial, SharedString, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions,
+    FrostedGlassBlending, FrostedGlassMaterial, SharedString, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 
 struct FrostedGlassExample {
@@ -11,10 +11,13 @@ struct FrostedGlassExample {
 impl Render for FrostedGlassExample {
     fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+
+            .rounded_md()
             .flex()
             .flex_col()
             .gap_4()
             .p_4()
+            .mt_128()
             .justify_center()
             .items_center()
             .text_xl()
@@ -75,12 +78,11 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_background: WindowBackgroundAppearance::FrostedGlass {
-                    material: FrostedGlassMaterial::HudWindow,
-                    blending_mode: FrostedGlassBlending::BehindWindow,
-                    tint_color: Some(hsla(0.6, 0.3, 0.7, 0.2)), // Light blue tint
-                    saturation: 0.8,                            // Slightly desaturated
-                },
+                window_background: WindowBackgroundAppearance::Blurred,
+                titlebar: Some(TitlebarOptions {
+                    appears_transparent: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             |_, cx| {
