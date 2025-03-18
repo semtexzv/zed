@@ -1100,7 +1100,51 @@ impl Default for WindowAppearance {
 
 /// The appearance of the background of the window itself, when there is
 /// no content or the content is transparent.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+/// Material types for the frosted glass effect (maps to NSVisualEffectMaterial)
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+pub enum FrostedGlassMaterial {
+    /// Standard material that adapts to light and dark themes
+    #[default]
+    Standard,
+    /// Titlebar appearance
+    Titlebar,
+    /// Selection appearance
+    Selection,
+    /// Menu appearance
+    Menu,
+    /// Popover appearance
+    Popover,
+    /// Sidebar appearance
+    Sidebar,
+    /// Head-up display appearance (darker)
+    HeaderView,
+    /// Sheet appearance
+    Sheet,
+    /// Window background appearance
+    WindowBackground,
+    /// HUD window appearance (darkest)
+    HudWindow,
+    /// Full-screen UI appearance
+    FullScreenUI,
+    /// Tooltip appearance
+    Tooltip,
+}
+
+/// Blending modes for the frosted glass effect (maps to NSVisualEffectBlendingMode)
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+pub enum FrostedGlassBlending {
+    /// Blend behind the window
+    #[default]
+    BehindWindow,
+    /// Blend within the window
+    WithinWindow,
+}
+
+/// Controls the transparency and blur effect of a window's background.
+/// 
+/// This enum provides options for how a window's background should be rendered,
+/// from fully opaque to various types of transparency and blur effects.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum WindowBackgroundAppearance {
     /// Opaque.
     ///
@@ -1117,6 +1161,17 @@ pub enum WindowBackgroundAppearance {
     ///
     /// Not always supported.
     Blurred,
+    /// macOS-style frosted glass effect with customizable properties
+    FrostedGlass {
+        /// Material type for the visual effect (corresponds to NSVisualEffectMaterial)
+        material: FrostedGlassMaterial,
+        /// Blending mode for the visual effect
+        blending_mode: FrostedGlassBlending,
+        /// Optional tint color for the frosted glass
+        tint_color: Option<crate::Hsla>,
+        /// Saturation adjustment (1.0 = normal, 0.0 = grayscale)
+        saturation: f32,
+    },
 }
 
 /// The options that can be configured for a file dialog prompt

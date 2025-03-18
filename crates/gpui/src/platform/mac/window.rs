@@ -7,6 +7,7 @@ use crate::{
     RequestFrameOptions, ScaledPixels, Size, Timer, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowKind, WindowParams,
 };
+use crate::{FrostedGlassBlending, FrostedGlassMaterial};
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
@@ -32,6 +33,7 @@ use objc::{
     sel, sel_impl,
 };
 use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
@@ -78,6 +80,47 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+
+// NSVisualEffectView constants
+#[allow(non_upper_case_globals)]
+const NSVisualEffectStateActive: NSInteger = 1;
+// NSVisualEffectMaterial constants
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialLight: NSInteger = 1;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialDark: NSInteger = 2;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialTitlebar: NSInteger = 3;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialSelection: NSInteger = 4;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialMenu: NSInteger = 5;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialPopover: NSInteger = 6;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialSidebar: NSInteger = 7;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialHeaderView: NSInteger = 10;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialSheet: NSInteger = 11;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialWindowBackground: NSInteger = 12;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialHUDWindow: NSInteger = 13;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialFullScreenUI: NSInteger = 15;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectMaterialToolTip: NSInteger = 17;
+// NSVisualEffectBlendingMode constants
+#[allow(non_upper_case_globals)]
+const NSVisualEffectBlendingModeBehindWindow: NSInteger = 0;
+#[allow(non_upper_case_globals)]
+const NSVisualEffectBlendingModeWithinWindow: NSInteger = 1;
+// NSWindow positioning constants
+#[allow(non_upper_case_globals)]
+const NSWindowBelow: NSInteger = -1;
+#[allow(non_upper_case_globals)]
+const NSWindowAbove: NSInteger = 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -323,6 +366,7 @@ struct MacWindowState {
     handle: AnyWindowHandle,
     executor: ForegroundExecutor,
     native_window: id,
+    visual_effect_view: id,
     native_view: NonNull<Object>,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
@@ -629,6 +673,7 @@ impl MacWindow {
                 external_files_dragged: false,
                 first_mouse: false,
                 fullscreen_restore_bounds: Bounds::default(),
+                visual_effect_view: nil,
             })));
 
             (*native_window).set_ivar(
@@ -987,28 +1032,138 @@ impl PlatformWindow for MacWindow {
         this.renderer
             .update_transparency(background_appearance != WindowBackgroundAppearance::Opaque);
 
-        let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
-            80
-        } else {
-            0
-        };
-        let opaque = if background_appearance == WindowBackgroundAppearance::Opaque {
-            YES
-        } else {
-            NO
-        };
         unsafe {
-            this.native_window.setOpaque_(opaque);
-            // Shadows for transparent windows cause artifacts and performance issues
-            this.native_window.setHasShadow_(opaque);
-            let clear_color = if opaque == YES {
-                NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 1f64)
-            } else {
-                NSColor::clearColor(nil)
-            };
-            this.native_window.setBackgroundColor_(clear_color);
-            let window_number = this.native_window.windowNumber();
-            CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, blur_radius);
+            match background_appearance {
+                WindowBackgroundAppearance::Opaque => {
+                    // Remove visual effect view if it exists
+                    if this.visual_effect_view != nil {
+                        let _: () = msg_send![this.visual_effect_view, removeFromSuperview];
+                        this.visual_effect_view = nil;
+                    }
+
+                    // Set window to opaque
+                    this.native_window.setOpaque_(YES);
+                    this.native_window.setHasShadow_(YES);
+                    let background_color =
+                        NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 1f64);
+                    this.native_window.setBackgroundColor_(background_color);
+
+                    // Reset any blur
+                    let window_number = this.native_window.windowNumber();
+                    CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, 0);
+                }
+
+                WindowBackgroundAppearance::Transparent => {
+                    // Remove visual effect view if it exists
+                    if this.visual_effect_view != nil {
+                        let _: () = msg_send![this.visual_effect_view, removeFromSuperview];
+                        this.visual_effect_view = nil;
+                    }
+
+                    // Set window to transparent
+                    this.native_window.setOpaque_(NO);
+                    this.native_window.setHasShadow_(NO);
+                    let clear_color = NSColor::clearColor(nil);
+                    this.native_window.setBackgroundColor_(clear_color);
+
+                    // Reset any blur
+                    let window_number = this.native_window.windowNumber();
+                    CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, 0);
+                }
+
+                WindowBackgroundAppearance::Blurred => {
+                    // Remove visual effect view if it exists - we'll use the private API for simple blur
+                    if this.visual_effect_view != nil {
+                        let _: () = msg_send![this.visual_effect_view, removeFromSuperview];
+                        this.visual_effect_view = nil;
+                    }
+
+                    // Set window to transparent
+                    this.native_window.setOpaque_(NO);
+                    this.native_window.setHasShadow_(NO);
+                    let clear_color = NSColor::clearColor(nil);
+                    this.native_window.setBackgroundColor_(clear_color);
+
+                    // Apply blur using private API
+                    let window_number = this.native_window.windowNumber();
+                    CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), window_number, 80);
+                }
+
+                WindowBackgroundAppearance::FrostedGlass {
+                    material,
+                    blending_mode: _,
+                    tint_color: _,
+                    saturation: _,
+                } => {
+                    // Configure window for transparency
+                    this.native_window.setOpaque_(NO);
+                    this.native_window.setHasShadow_(YES);
+                    let clear_color = NSColor::clearColor(nil);
+                    this.native_window.setBackgroundColor_(clear_color);
+
+                    // Find the window's content view
+                    let content_view: id = msg_send![this.native_window, contentView];
+                    let frame: NSRect = msg_send![content_view, frame];
+
+                    // Remove existing visual effect view if any
+                    if this.visual_effect_view != nil {
+                        let _: () = msg_send![this.visual_effect_view, removeFromSuperview];
+                        this.visual_effect_view = nil;
+                    }
+
+                    // Create the visual effect view with the same frame as the content view
+                    this.visual_effect_view = msg_send![class!(NSVisualEffectView), alloc];
+                    let _: () = msg_send![this.visual_effect_view, initWithFrame:frame];
+
+                    // Set material based on the provided enum
+                    let material_value = match material {
+                        FrostedGlassMaterial::HudWindow => NSVisualEffectMaterialHUDWindow,
+                        FrostedGlassMaterial::Titlebar => NSVisualEffectMaterialTitlebar,
+                        FrostedGlassMaterial::WindowBackground => {
+                            NSVisualEffectMaterialWindowBackground
+                        }
+                        _ => NSVisualEffectMaterialLight, // Default for other materials
+                    };
+
+                    // Configure the visual effect view properties
+                    let _: () = msg_send![this.visual_effect_view, setMaterial:material_value];
+                    let _: () =
+                        msg_send![this.visual_effect_view, setState:NSVisualEffectStateActive];
+                    let _: () = msg_send![this.visual_effect_view, setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+
+                    // Make sure it resizes with the window
+                    let resize_mask = NSViewWidthSizable | NSViewHeightSizable;
+                    let _: () = msg_send![this.visual_effect_view, setAutoresizingMask:resize_mask];
+
+                    // Make the Metal content view/layer transparent to show the blur
+                    let subviews: id = msg_send![content_view, subviews];
+                    let count: NSUInteger = msg_send![subviews, count];
+
+                    if count > 0 {
+                        for i in 0..count {
+                            let subview: id = msg_send![subviews, objectAtIndex:i];
+                            let _: () = msg_send![subview, setWantsLayer:YES];
+                            let layer: id = msg_send![subview, layer];
+                            if !layer.is_null() {
+                                let _: () = msg_send![layer, setOpaque:NO];
+                                let _: () = msg_send![layer, setBackgroundColor:clear_color];
+                            }
+                        }
+                    } else {
+                        // If no subviews, just make the content view itself transparent
+                        let _: () = msg_send![content_view, setWantsLayer:YES];
+                        let layer: id = msg_send![content_view, layer];
+                        let _: () = msg_send![layer, setOpaque:NO];
+                        let _: () = msg_send![layer, setBackgroundColor:clear_color];
+                    }
+
+                    // Insert the visual effect view behind everything else
+                    const NS_BELOW: NSInteger = -1; // NSWindowBelow value
+                    let _: () = msg_send![content_view, addSubview:this.visual_effect_view
+                                            positioned:NS_BELOW
+                                            relativeTo:nil];
+                }
+            }
         }
     }
 
