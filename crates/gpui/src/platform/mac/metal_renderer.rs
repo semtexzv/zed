@@ -1,8 +1,8 @@
 use super::metal_atlas::MetalAtlas;
 use crate::{
     point, size, AtlasTextureId, AtlasTextureKind, AtlasTile, Background, Bounds, ContentMask,
-    DevicePixels, MonochromeSprite, PaintSurface, Path, PathId, PathVertex, PolychromeSprite,
-    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline,
+    DevicePixels, MonochromeSprite, PaintSurface, Path, PathId, PathVertex, PolychromeSprite, 
+    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Surface, Underline, scene::DamageRegion,
 };
 use anyhow::{anyhow, Result};
 use block::ConcreteBlock;
@@ -103,11 +103,21 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    stencil_pipeline_state: metal::RenderPipelineState, // Pipeline for stencil buffer operations
     unit_vertices: metal::Buffer,
+    quad_vertices: metal::Buffer, // Buffer for stencil quad vertices
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: CVMetalTextureCache,
+    stencil_texture: Option<metal::Texture>, // Cache for stencil texture
+}
+
+// Structure for representing a damage region quad for stencil marking
+#[repr(C)]
+struct StencilQuad {
+    origin: PointF,
+    size: Size<f32>,
 }
 
 impl MetalRenderer {
@@ -236,6 +246,30 @@ impl MetalRenderer {
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), PATH_SAMPLE_COUNT));
         let core_video_texture_cache =
             unsafe { CVMetalTextureCache::new(device.as_ptr()).unwrap() };
+            
+        // Create the stencil pipeline state
+        let stencil_pipeline_state = build_stencil_pipeline_state(
+            &device,
+            &library,
+            "stencil_marker",
+            "stencil_marker_vertex",
+            "stencil_marker_fragment"
+        );
+        
+        // Create quad vertices for stencil operations (unit square)
+        let quad_vertices = [
+            point(0.0, 0.0),
+            point(1.0, 0.0),
+            point(0.0, 1.0),
+            point(1.0, 0.0),
+            point(1.0, 1.0),
+            point(0.0, 1.0),
+        ];
+        let quad_vertices = device.new_buffer_with_data(
+            quad_vertices.as_ptr() as *const c_void,
+            mem::size_of_val(&quad_vertices) as u64,
+            MTLResourceOptions::StorageModeManaged,
+        );
 
         Self {
             device,
@@ -250,10 +284,13 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            stencil_pipeline_state,
             unit_vertices,
+            quad_vertices,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            stencil_texture: None,
         }
     }
 
@@ -295,8 +332,433 @@ impl MetalRenderer {
     pub fn destroy(&self) {
         // nothing to do
     }
+    
+    /// Draw the scene using stencil to only redraw damaged regions
+    pub fn draw_with_damage(&mut self, scene: &Scene, damage_region: &DamageRegion) -> Result<()> {
+        if damage_region.is_empty() {
+            return Ok(()); // Nothing to draw
+        }
+        
+        let layer = self.layer.clone();
+        let viewport_size = layer.drawable_size();
+        let viewport_size: Size<DevicePixels> = size(
+            (viewport_size.width.ceil() as i32).into(),
+            (viewport_size.height.ceil() as i32).into(),
+        );
+        
+        let drawable = if let Some(drawable) = layer.next_drawable() {
+            drawable
+        } else {
+            log::error!(
+                "failed to retrieve next drawable, drawable size: {:?}",
+                viewport_size
+            );
+            return Ok(());
+        };
 
-    pub fn draw(&mut self, scene: &Scene) {
+        // Create stencil texture if needed
+        let stencil_texture = self.get_stencil_texture(viewport_size);
+        
+        // Step 1: Set up render pass with stencil attachment
+        let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+            
+        color_attachment.set_texture(Some(drawable.texture()));
+        color_attachment.set_load_action(metal::MTLLoadAction::Load); // Keep existing content
+        color_attachment.set_store_action(metal::MTLStoreAction::Store);
+        
+        // Set up stencil attachment
+        let stencil_attachment = render_pass_descriptor
+            .stencil_attachment()
+            .unwrap();
+            
+        stencil_attachment.set_texture(Some(&stencil_texture));
+        stencil_attachment.set_load_action(metal::MTLLoadAction::Clear);
+        stencil_attachment.set_store_action(metal::MTLStoreAction::DontCare);
+        stencil_attachment.set_clear_stencil(0); // Clear stencil to 0
+        
+        // Create a local reference to the command queue to prevent borrow issues
+        let command_queue = self.command_queue.clone();
+        let command_buffer = command_queue.new_command_buffer();
+        
+        // Step 2: Fill stencil buffer with 1s in damaged regions
+        let stencil_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        stencil_encoder.set_render_pipeline_state(&self.stencil_pipeline_state);
+        
+        // Set stencil state to always write 1 to stencil buffer
+        let stencil_descriptor = metal::StencilDescriptor::new();
+        stencil_descriptor.set_stencil_compare_function(metal::MTLCompareFunction::Always);
+        stencil_descriptor.set_stencil_failure_operation(metal::MTLStencilOperation::Keep);
+        stencil_descriptor.set_depth_failure_operation(metal::MTLStencilOperation::Keep);
+        stencil_descriptor.set_depth_stencil_pass_operation(metal::MTLStencilOperation::Replace);
+        stencil_descriptor.set_read_mask(0xFF);
+        stencil_descriptor.set_write_mask(0xFF);
+        
+        let depth_stencil_descriptor = metal::DepthStencilDescriptor::new();
+        depth_stencil_descriptor.set_front_face_stencil(Some(&stencil_descriptor));
+        depth_stencil_descriptor.set_back_face_stencil(Some(&stencil_descriptor));
+        
+        let depth_stencil_state = self.device.new_depth_stencil_state(&depth_stencil_descriptor);
+        stencil_encoder.set_depth_stencil_state(&depth_stencil_state);
+        stencil_encoder.set_stencil_reference_value(1); // Write 1s to stencil
+        
+        // Set viewport to match drawable size
+        stencil_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: i32::from(viewport_size.width) as f64,
+            height: i32::from(viewport_size.height) as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        
+        // Draw quads for each damage region
+        stencil_encoder.set_vertex_buffer(0, Some(&self.quad_vertices), 0);
+        stencil_encoder.set_vertex_bytes(
+            2, 
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _
+        );
+        
+        // Create buffer for damage region quads
+        let quads: Vec<StencilQuad> = damage_region.bounds.iter().map(|bounds| {
+            StencilQuad {
+                origin: bounds.origin.map(|p| p.0),
+                size: bounds.size.map(|s| s.0),
+            }
+        }).collect();
+        
+        if !quads.is_empty() {
+            let quad_buffer = self.device.new_buffer_with_data(
+                quads.as_ptr() as *const c_void,
+                (mem::size_of::<StencilQuad>() * quads.len()) as u64,
+                MTLResourceOptions::StorageModeManaged
+            );
+            
+            stencil_encoder.set_vertex_buffer(1, Some(&quad_buffer), 0);
+            stencil_encoder.draw_primitives_instanced(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                6, // 6 vertices for quad (2 triangles)
+                quads.len() as u64
+            );
+        }
+        
+        stencil_encoder.end_encoding();
+        
+        // Step 3: Render scene but only where stencil == 1
+        let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+            
+        color_attachment.set_texture(Some(drawable.texture()));
+        color_attachment.set_load_action(metal::MTLLoadAction::Load);
+        color_attachment.set_store_action(metal::MTLStoreAction::Store);
+        
+        // Reuse stencil texture
+        let stencil_attachment = render_pass_descriptor
+            .stencil_attachment()
+            .unwrap();
+            
+        stencil_attachment.set_texture(Some(&stencil_texture));
+        stencil_attachment.set_load_action(metal::MTLLoadAction::Load); // Keep stencil content
+        stencil_attachment.set_store_action(metal::MTLStoreAction::DontCare);
+        
+        loop {
+            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+
+            let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+            
+            // Set stencil test to only render where stencil == 1
+            let stencil_descriptor = metal::StencilDescriptor::new();
+            stencil_descriptor.set_stencil_compare_function(metal::MTLCompareFunction::Equal);
+            stencil_descriptor.set_stencil_failure_operation(metal::MTLStencilOperation::Keep);
+            stencil_descriptor.set_depth_failure_operation(metal::MTLStencilOperation::Keep);
+            stencil_descriptor.set_depth_stencil_pass_operation(metal::MTLStencilOperation::Keep);
+            stencil_descriptor.set_read_mask(0xFF);
+            stencil_descriptor.set_write_mask(0x00); // Don't modify stencil during rendering
+            
+            let depth_stencil_descriptor = metal::DepthStencilDescriptor::new();
+            depth_stencil_descriptor.set_front_face_stencil(Some(&stencil_descriptor));
+            depth_stencil_descriptor.set_back_face_stencil(Some(&stencil_descriptor));
+            
+            let depth_stencil_state = self.device.new_depth_stencil_state(&depth_stencil_descriptor);
+            command_encoder.set_depth_stencil_state(&depth_stencil_state);
+            command_encoder.set_stencil_reference_value(1); // Test against 1
+            
+            command_encoder.set_viewport(metal::MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: i32::from(viewport_size.width) as f64,
+                height: i32::from(viewport_size.height) as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            
+            // Draw scene primitives - to avoid a borrow issue, we need to use low-level primitive drawing instead
+            let mut instance_offset = 0;
+            
+            // Create a local clone of the command queue to avoid borrow issues
+            let command_queue = self.command_queue.clone();
+            
+            // First rasterize paths
+            let path_tiles = match self.rasterize_paths(
+                scene.paths(),
+                &mut instance_buffer,
+                &mut instance_offset,
+                command_queue.new_command_buffer(),
+            ) {
+                Some(tiles) => tiles,
+                None => {
+                    command_encoder.end_encoding();
+                    return Err(anyhow!("failed to rasterize {} paths", scene.paths().len()));
+                }
+            };
+            
+            // Draw each batch type
+            let mut success = true;
+            for batch in scene.batches() {
+                let ok = match batch {
+                    PrimitiveBatch::Shadows(shadows) => self.draw_shadows(
+                        shadows,
+                        &mut instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::Quads(quads) => self.draw_quads(
+                        quads,
+                        &mut instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::Paths(paths) => self.draw_paths(
+                        paths,
+                        &path_tiles,
+                        &mut instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::Underlines(underlines) => self.draw_underlines(
+                        underlines,
+                        &mut instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::MonochromeSprites {
+                        texture_id,
+                        sprites,
+                    } => self.draw_monochrome_sprites(
+                        texture_id,
+                        sprites,
+                        &mut instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::PolychromeSprites {
+                        texture_id,
+                        sprites,
+                    } => self.draw_polychrome_sprites(
+                        texture_id,
+                        sprites,
+                        &mut instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                    PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(
+                        surfaces,
+                        &mut instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    ),
+                };
+                if !ok {
+                    success = false;
+                    break;
+                }
+            }
+            
+            instance_buffer.metal_buffer.did_modify_range(NSRange {
+                location: 0,
+                length: instance_offset as NSUInteger,
+            });
+            
+            let result = if success {
+                Ok(())
+            } else {
+                Err(anyhow!("scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    scene.paths.len(),
+                    scene.shadows.len(),
+                    scene.quads.len(),
+                    scene.underlines.len(),
+                    scene.monochrome_sprites.len(),
+                    scene.polychrome_sprites.len(),
+                    scene.surfaces.len(),
+                ))
+            };
+            
+            command_encoder.end_encoding();
+            
+            match result {
+                Ok(_) => {
+                    let instance_buffer_pool = self.instance_buffer_pool.clone();
+                    let instance_buffer = Cell::new(Some(instance_buffer));
+                    let block = ConcreteBlock::new(move |_| {
+                        if let Some(instance_buffer) = instance_buffer.take() {
+                            instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                    });
+                    let block = block.copy();
+                    command_buffer.add_completed_handler(&block);
+
+                    if self.presents_with_transaction {
+                        command_buffer.commit();
+                        command_buffer.wait_until_scheduled();
+                        drawable.present();
+                    } else {
+                        command_buffer.present_drawable(drawable);
+                        command_buffer.commit();
+                    }
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::error!(
+                        "failed to render: {}. retrying with larger instance buffer size",
+                        err
+                    );
+                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
+                    let buffer_size = instance_buffer_pool.buffer_size;
+                    if buffer_size >= 256 * 1024 * 1024 {
+                        log::error!("instance buffer size grew too large: {}", buffer_size);
+                        break;
+                    }
+                    instance_buffer_pool.reset(buffer_size * 2);
+                    log::info!(
+                        "increased instance buffer size to {}",
+                        instance_buffer_pool.buffer_size
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper method for drawing scene primitives with an existing command encoder
+    fn draw_scene_primitives(
+        &mut self,
+        scene: &Scene,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
+        // First rasterize paths
+        let path_tiles = match self.rasterize_paths(
+            scene.paths(),
+            instance_buffer,
+            instance_offset,
+            self.command_queue.new_command_buffer(),
+        ) {
+            Some(tiles) => tiles,
+            None => return Err(anyhow!("failed to rasterize {} paths", scene.paths().len())),
+        };
+        
+        // Draw scene batches
+        for batch in scene.batches() {
+            let ok = match batch {
+                PrimitiveBatch::Shadows(shadows) => self.draw_shadows(
+                    shadows,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Quads(quads) => self.draw_quads(
+                    quads,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Paths(paths) => self.draw_paths(
+                    paths,
+                    &path_tiles,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Underlines(underlines) => self.draw_underlines(
+                    underlines,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::MonochromeSprites {
+                    texture_id,
+                    sprites,
+                } => self.draw_monochrome_sprites(
+                    texture_id,
+                    sprites,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::PolychromeSprites {
+                    texture_id,
+                    sprites,
+                } => self.draw_polychrome_sprites(
+                    texture_id,
+                    sprites,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(
+                    surfaces,
+                    instance_buffer,
+                    instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+            };
+
+            if !ok {
+                return Err(anyhow!("scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    scene.paths.len(),
+                    scene.shadows.len(),
+                    scene.quads.len(),
+                    scene.underlines.len(),
+                    scene.monochrome_sprites.len(),
+                    scene.polychrome_sprites.len(),
+                    scene.surfaces.len(),
+                ));
+            }
+        }
+        
+        instance_buffer.metal_buffer.did_modify_range(NSRange {
+            location: 0,
+            length: *instance_offset as NSUInteger,
+        });
+        
+        Ok(())
+    }
+
+    pub fn draw(&mut self, scene: &Scene) -> Result<()> {
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -310,7 +772,7 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
+            return Ok(());
         };
 
         loop {
@@ -339,7 +801,7 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
-                    return;
+                    return Ok(());
                 }
                 Err(err) => {
                     log::error!(
@@ -360,6 +822,7 @@ impl MetalRenderer {
                 }
             }
         }
+        Ok(())
     }
 
     fn draw_primitives(
@@ -1032,6 +1495,30 @@ impl MetalRenderer {
         true
     }
 
+    /// Helper to create or get stencil texture
+    fn get_stencil_texture(&mut self, size: Size<DevicePixels>) -> metal::Texture {
+        // Check if we have a cached texture of the right size
+        if let Some(texture) = self.stencil_texture.as_ref() {
+            if texture.width() == size.width.0 as u64 && 
+               texture.height() == size.height.0 as u64 {
+                return texture.clone();
+            }
+        }
+        
+        // Create new stencil texture
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_texture_type(metal::MTLTextureType::D2);
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::Stencil8); // 8-bit stencil
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        
+        let texture = self.device.new_texture(&descriptor);
+        self.stencil_texture = Some(texture.clone());
+        texture
+    }
+    
     fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
@@ -1165,6 +1652,38 @@ fn build_pipeline_state(
     device
         .new_render_pipeline_state(&descriptor)
         .expect("could not create render pipeline state")
+}
+
+/// Build a pipeline state for stencil operations
+fn build_stencil_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating stencil vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating stencil fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+    color_attachment.set_write_mask(metal::MTLColorWriteMask::None); // Don't write to color buffer
+    
+    // Enable stencil attachment
+    descriptor.set_stencil_attachment_pixel_format(metal::MTLPixelFormat::Stencil8);
+    
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create stencil pipeline state")
 }
 
 fn build_path_rasterization_pipeline_state(

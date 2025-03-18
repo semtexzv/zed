@@ -3,6 +3,17 @@
 
 using namespace metal;
 
+// Data structure for stencil quads representing damage regions
+struct StencilQuad {
+    float2 origin;
+    float2 size;
+};
+
+// Output for stencil marker vertex shader
+struct StencilVertexOutput {
+    float4 position [[position]];
+};
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -893,4 +904,36 @@ float4 fill_color(Background background,
   }
 
   return color;
+}
+
+// Vertex shader for drawing quads to stencil buffer
+vertex StencilVertexOutput stencil_marker_vertex(
+    uint vertex_id [[vertex_id]],
+    constant float2* vertices [[buffer(0)]],
+    constant StencilQuad* quads [[buffer(1)]],
+    uint instance_id [[instance_id]],
+    constant Size_DevicePixels* viewport_size [[buffer(2)]]
+) {
+    StencilVertexOutput output;
+
+    StencilQuad quad = quads[instance_id];
+    float2 position = vertices[vertex_id];
+
+    // Transform to quad position
+    float2 quad_position = position * quad.size + quad.origin;
+
+    // Convert to clip space (-1 to 1)
+    float2 normalized_position = float2(
+        2.0 * quad_position.x / float(viewport_size->width) - 1.0,
+        1.0 - 2.0 * quad_position.y / float(viewport_size->height)
+    );
+
+    output.position = float4(normalized_position, 0.0, 1.0);
+
+    return output;
+}
+
+// Simple fragment shader that just writes to stencil (no color output)
+fragment void stencil_marker_fragment() {
+    // Nothing to do - stencil will be written based on pipeline state
 }

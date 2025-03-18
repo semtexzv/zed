@@ -5,7 +5,7 @@ use crate::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformWindow, Point, PromptLevel,
     RequestFrameOptions, ScaledPixels, Size, Timer, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowParams,
+    WindowBounds, WindowKind, WindowParams, scene::DamageRegion,
 };
 use block::ConcreteBlock;
 use cocoa::{
@@ -1114,7 +1114,18 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &crate::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        if let Err(e) = this.renderer.draw(scene) {
+            log::error!("Error in draw: {}", e);
+        }
+    }
+    
+    fn draw_with_damage(&self, scene: &crate::Scene, damage_region: &DamageRegion) {
+        let mut this = self.0.lock();
+        if let Err(e) = this.renderer.draw_with_damage(scene, damage_region) {
+            log::error!("Error in draw_with_damage: {}", e);
+            // Fallback to normal draw on error
+            let _ = this.renderer.draw(scene);
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

@@ -12,6 +12,37 @@ pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
 pub(crate) type DrawOrder = u32;
 
+/// Tracks regions of the screen that need to be redrawn
+#[derive(Default, Clone)]
+pub struct DamageRegion {
+    /// Bounds of damaged areas
+    pub bounds: Vec<Bounds<ScaledPixels>>,
+}
+
+impl DamageRegion {
+    /// Creates a new empty damage region
+    pub fn new() -> Self {
+        Self { bounds: Vec::new() }
+    }
+    
+    /// Adds a screen region to the set of damaged areas that need redrawing
+    pub fn add(&mut self, region: Bounds<ScaledPixels>) {
+        if !region.is_empty() {
+            self.bounds.push(region);
+        }
+    }
+    
+    /// Clears all damage regions
+    pub fn clear(&mut self) {
+        self.bounds.clear();
+    }
+    
+    /// Returns true if there are no damaged regions
+    pub fn is_empty(&self) -> bool {
+        self.bounds.is_empty()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
@@ -24,6 +55,7 @@ pub(crate) struct Scene {
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
     pub(crate) surfaces: Vec<PaintSurface>,
+    pub(crate) damage_region: DamageRegion,
 }
 
 impl Scene {
@@ -38,6 +70,22 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.damage_region.clear();
+    }
+    
+    /// Mark a region as damaged, requiring redraw
+    pub fn mark_damaged(&mut self, region: Bounds<ScaledPixels>) {
+        self.damage_region.add(region);
+    }
+    
+    /// Get a reference to the current damage region
+    pub fn damage_region(&self) -> &DamageRegion {
+        &self.damage_region
+    }
+    
+    /// Take the current damage region, replacing it with an empty one
+    pub fn take_damage_region(&mut self) -> DamageRegion {
+        std::mem::take(&mut self.damage_region)
     }
 
     #[cfg_attr(

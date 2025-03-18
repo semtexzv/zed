@@ -4,6 +4,8 @@
 mod app_menu;
 mod keystroke;
 
+use crate::scene::DamageRegion;
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux;
 
@@ -411,6 +413,10 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn draw(&self, scene: &Scene);
+    fn draw_with_damage(&self, scene: &Scene, _damage_region: &DamageRegion) {
+        // Default implementation falls back to full redraw
+        self.draw(scene);
+    }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
 

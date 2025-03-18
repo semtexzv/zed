@@ -1,3 +1,4 @@
+use crate::scene::DrawOrder;
 use crate::{
     point, prelude::*, px, size, transparent_black, Action, AnyDrag, AnyElement, AnyTooltip,
     AnyView, App, AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, Background, Bounds,
@@ -13,7 +14,7 @@ use crate::{
     Subscription, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement, TransformationMatrix,
     Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS, scene::DamageRegion,
 };
 use anyhow::{anyhow, Context as _, Result};
 use collections::{FxHashMap, FxHashSet};
@@ -88,6 +89,7 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    pub damage_region: DamageRegion,
 }
 
 #[derive(Clone)]
@@ -102,6 +104,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                damage_region: DamageRegion::new(),
             })),
         }
     }
@@ -140,6 +143,31 @@ impl WindowInvalidator {
 
     pub fn not_drawing(&self) -> bool {
         self.inner.borrow().draw_phase == DrawPhase::None
+    }
+    
+    /// Mark a view and its associated screen region as dirty
+    pub fn invalidate_view_region(
+        &self, 
+        entity: EntityId, 
+        region: Bounds<ScaledPixels>, 
+        cx: &mut App
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        inner.dirty_views.insert(entity);
+        inner.damage_region.add(region);
+        
+        if inner.draw_phase == DrawPhase::None {
+            inner.dirty = true;
+            cx.push_effect(Effect::Notify { emitter: entity });
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Take the current damage region, replacing it with an empty one
+    pub fn take_damage_region(&self) -> DamageRegion {
+        std::mem::take(&mut self.inner.borrow_mut().damage_region)
     }
 
     #[track_caller]
@@ -625,6 +653,8 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    pub(crate) pending_damage_regions: Vec<Bounds<ScaledPixels>>,
+    pub(crate) debug_damage_regions: bool, // Debug flag to visualize damage regions
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -909,6 +939,8 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
+            pending_damage_regions: Vec::new(),
+            debug_damage_regions: false, // Default to off, can be enabled via API
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -988,6 +1020,14 @@ impl Window {
                 break;
             }
         }
+        
+        // For now, mark the entire viewport as damaged
+        // In a more sophisticated implementation, we would track the bounds of each view
+        let viewport_bounds = Bounds {
+            origin: Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: self.viewport_size.map(|p| ScaledPixels(p.0 * self.scale_factor())),
+        };
+        self.pending_damage_regions.push(viewport_bounds);
     }
 
     /// Registers a callback to be invoked when the window appearance changes.
@@ -1335,6 +1375,18 @@ impl Window {
         self.appearance
     }
 
+    /// Enable or disable the visualization of damage regions.
+    /// When enabled, damage regions will be highlighted with semi-transparent colors
+    /// to show which parts of the screen are being redrawn.
+    pub fn set_debug_damage_regions(&mut self, enabled: bool) {
+        self.debug_damage_regions = enabled;
+    }
+    
+    /// Check if damage region debugging is enabled
+    pub fn debug_damage_regions(&self) -> bool {
+        self.debug_damage_regions
+    }
+
     /// Returns the size of the drawable area within the window.
     pub fn viewport_size(&self) -> Size<Pixels> {
         self.viewport_size
@@ -1613,8 +1665,64 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&self) {
-        self.platform_window.draw(&self.rendered_frame.scene);
+    fn present(&mut self) {
+        // Apply any pending damage regions to the scene
+        let mut damage_region = self.rendered_frame.scene.damage_region().clone();
+        for region in &self.pending_damage_regions {
+            damage_region.add(*region);
+        }
+        self.pending_damage_regions.clear();
+        
+        // Normal drawing
+        if damage_region.is_empty() {
+            // Use normal drawing if no damage regions
+            self.platform_window.draw(&self.rendered_frame.scene);
+        } else {
+            // Use damage-aware drawing when we have damage regions
+            self.platform_window.draw_with_damage(&self.rendered_frame.scene, &damage_region);
+        }
+        
+        // Overlay visualization of damage regions if debug mode is enabled
+        if self.debug_damage_regions && !damage_region.is_empty() {
+            // Create a simple scene just for visualizing damage regions
+            let mut debug_scene = Scene::default();
+            
+            // Add a visualization quad for each damage region
+            for (i, region) in damage_region.bounds.iter().enumerate() {
+                // Generate a different color for each region
+                let hue = (i * 60) % 360; // Cycle through colors (60° increments)
+                let color = Hsla {
+                    h: hue as f32,
+                    s: 1.0,
+                    l: 0.5,
+                    a: 0.3, // Semi-transparent
+                };
+                
+                // Border color (darker version of fill)
+                let border_color = Hsla { h: hue as f32, s: 1.0, l: 0.3, a: 0.8 };
+                
+                // Draw a semi-transparent colored overlay
+                let quad = Quad {
+                    bounds: region.clone(),
+                    corner_radii: Corners::default(),
+                    background: color.into(), // Use From<Hsla> for Background
+                    border_widths: Edges::all(ScaledPixels(1.0)), // Create with correct type
+                    border_color,
+                    content_mask: ContentMask::default(),
+                    order: DrawOrder::max_value(),
+                    pad: 0,
+                };
+                
+                debug_scene.insert_primitive(quad);
+                
+                // Also add a text label showing region dimensions
+                // (This would require adding text support to the debug scene, omitted for simplicity)
+            }
+            
+            // Draw the debug visualization on top
+            self.platform_window.draw(&debug_scene);
+        }
+        
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
